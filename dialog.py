@@ -10,7 +10,8 @@ FIELDS = [
     {'field': '#ship',   'key': 'ships'},
     {'field': 'series', 'key': 'series'},
 ]
-SCAN_BATCH_SIZE = 10
+# Small batches per timer tick keep the UI responsive while scanning.
+SCAN_BATCH_SIZE = 2
 
 COLUMN_LABELS = [
     'Book', 'Detected fandom(s)', 'Current #fandom',
@@ -30,6 +31,13 @@ class ScannerDialog(QDialog):
         self.setWindowTitle('AO3 Metadata Scanner — Preview')
         self.resize(1200, 620)
 
+        # Validate target columns once, up front; disable the apply
+        # button for anything that doesn't exist yet.
+        self._missing_fields = {
+            spec['field'] for spec in FIELDS
+            if spec['field'] not in self.db.field_metadata
+        }
+
         layout = QVBoxLayout(self)
         intro = QLabel(
             'Scan EPUBs for labelled AO3 fandom, relationship, and series metadata. '
@@ -45,6 +53,13 @@ class ScannerDialog(QDialog):
         self.apply_btns = {}
         for spec in FIELDS:
             btn = QPushButton(f'Apply to empty {spec["field"]} fields')
+            btn.setEnabled(False)  # enabled after a scan finds rows
+            if spec['field'] in self._missing_fields:
+                btn.setEnabled(False)
+                btn.setToolTip(
+                    f'The {spec["field"]} column does not exist. '
+                    'Create it in Calibre preferences first.'
+                )
             self.apply_btns[spec['field']] = btn
         self.close_btn = QPushButton('Close')
 
@@ -73,7 +88,10 @@ class ScannerDialog(QDialog):
         self.scan_all_btn.clicked.connect(self.scan_all)
         for spec in FIELDS:
             self.apply_btns[spec['field']].clicked.connect(partial(self.apply_results, spec))
-        self.close_btn.clicked.connect(self.accept)
+        self.close_btn.clicked.connect(self.close)
+
+        self._scan_timer = QTimer(self)
+        self._scan_timer.timeout.connect(self._scan_batch)
 
     # ---------- scanning ----------
 
@@ -99,9 +117,6 @@ class ScannerDialog(QDialog):
         self._scanning = True
         self._set_buttons_enabled(False)
         self.status.setText(f'Scanning {len(self.pending_ids)} EPUB(s)…')
-        if not hasattr(self, '_scan_timer'):
-            self._scan_timer = QTimer(self)
-            self._scan_timer.timeout.connect(self._scan_batch)
         self._scan_timer.start(0)
 
     def _scan_batch(self):
@@ -139,7 +154,10 @@ class ScannerDialog(QDialog):
     # ---------- table ----------
 
     def _field_text(self, field, bid):
-        value = self.db.field_for(field, bid, default_value=())
+        try:
+            value = self.db.field_for(field, bid, default_value=())
+        except Exception:
+            return ''  # column missing — guarded by button state elsewhere
         if isinstance(value, str):
             return value
         return ', '.join(value or ())
@@ -180,11 +198,27 @@ class ScannerDialog(QDialog):
         summary = '; '.join(f'{n} with {lbl} data' for n, lbl in zip(counts, labels))
         self.status.setText(f'Checked {len(self.rows)} EPUB record(s); {summary}.')
 
+    def _has_scan_results(self):
+        return bool(self.rows)
+
     def _set_buttons_enabled(self, enabled):
-        for btn in (self.scan_selected_btn, self.scan_all_btn, self.close_btn):
+        for btn in (self.scan_selected_btn, self.scan_all_btn):
             btn.setEnabled(enabled)
-        for btn in self.apply_btns.values():
-            btn.setEnabled(enabled and not self._scanning)
+        # Close stays usable so the user can always leave the dialog;
+        # closing mid-scan stops the timer first (see closeEvent).
+        self.close_btn.setEnabled(True)
+        for spec in FIELDS:
+            btn = self.apply_btns[spec['field']]
+            if spec['field'] in self._missing_fields:
+                btn.setEnabled(False)
+            else:
+                btn.setEnabled(enabled and self._has_scan_results())
+
+    def closeEvent(self, event):
+        if self._scanning:
+            self._scan_timer.stop()
+            self._scanning = False
+        super().closeEvent(event)
 
     # ---------- applying ----------
 
@@ -192,7 +226,7 @@ class ScannerDialog(QDialog):
         field = spec['field']
         key = spec['key']
         existing_key = 'existing_' + key
-        if field not in self.db.field_metadata:
+        if field in self._missing_fields:
             QMessageBox.warning(self, 'AO3 Metadata Scanner',
                                 f'The {field} column was not found. Create it in Calibre first.')
             return
