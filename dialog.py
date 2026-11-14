@@ -2,13 +2,15 @@ from qt.core import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
                      QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView,
                      Qt, QAbstractItemView, QTimer)
 from functools import partial
-from calibre_plugins.ao3_fandom_scanner.parser import parse_epub
+from calibre_plugins.ao3_fandom_scanner.parser import parse_epub, parse_safety_flags
 
 # Central column configuration — make this read from plugin prefs later.
 FIELDS = [
     {'field': '#fandom', 'key': 'fandoms'},
     {'field': '#ship',   'key': 'ships'},
     {'field': 'series', 'key': 'series'},
+    {'field': '#nsfw', 'key': 'nsfw'},
+    {'field': '#dead_dove', 'key': 'dead_dove'},
 ]
 # Small batches per timer tick keep the UI responsive while scanning.
 SCAN_BATCH_SIZE = 2
@@ -16,7 +18,9 @@ SCAN_BATCH_SIZE = 2
 COLUMN_LABELS = [
     'Book', 'Detected fandom(s)', 'Current #fandom',
     'Detected relationship(s)', 'Current #ship',
-    'Detected series', 'Current #series', 'Result',
+    'Detected series', 'Current #series',
+    'Detected NSFW', 'Current #nsfw',
+    'Detected Dead Dove: Do Not Eat', 'Current #dead_dove', 'Result',
 ]
 
 
@@ -40,9 +44,9 @@ class ScannerDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            'Scan EPUBs for labelled AO3 fandom, relationship, and series metadata. '
+            'Scan EPUBs for AO3 fandom, relationship, series, NSFW, and Dead Dove metadata. '
             'Preview does not change book data. Existing custom-column values '
-            'are shown and will be skipped when applying.'
+            'are shown. Applying replaces existing values for fields with detected data.'
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -52,7 +56,7 @@ class ScannerDialog(QDialog):
         self.scan_all_btn = QPushButton('Scan all EPUBs')
         self.apply_btns = {}
         for spec in FIELDS:
-            btn = QPushButton(f'Apply to empty {spec["field"]} fields')
+            btn = QPushButton(f'Replace {spec["field"]} values')
             btn.setEnabled(False)  # enabled after a scan finds rows
             if spec['field'] in self._missing_fields:
                 btn.setEnabled(False)
@@ -139,6 +143,7 @@ class ScannerDialog(QDialog):
             row['existing_' + spec['key']] = self._field_text(spec['field'], bid)
         path = self.db.format_abspath(bid, 'EPUB')
         if not path:
+            row['nsfw'], row['dead_dove'] = 'No', 'No'
             row['result'] = 'EPUB file unavailable'
         else:
             try:
@@ -147,6 +152,7 @@ class ScannerDialog(QDialog):
                 fandoms = ships = series = None
                 result = f'Parse error: {e}'
             row['fandoms'], row['ships'], row['series'] = fandoms, ships, series
+            row['nsfw'], row['dead_dove'] = parse_safety_flags(path)
             row['result'] = result
         self.rows.append(row)
         self._append_row_to_table(row)
@@ -171,6 +177,8 @@ class ScannerDialog(QDialog):
             row['existing_ships'],
             ', '.join(row['series']) if row['series'] else '',
             row['existing_series'],
+            row['nsfw'] or '', row['existing_nsfw'],
+            row['dead_dove'] or '', row['existing_dead_dove'],
             row['result'],
         )
 
@@ -194,7 +202,7 @@ class ScannerDialog(QDialog):
 
     def _update_status(self):
         counts = [sum(1 for x in self.rows if x[s['key']]) for s in FIELDS]
-        labels = ['#fandom', '#ship', '#series']
+        labels = ['#fandom', '#ship', '#series', '#nsfw', '#dead_dove']
         summary = '; '.join(f'{n} with {lbl} data' for n, lbl in zip(counts, labels))
         self.status.setText(f'Checked {len(self.rows)} EPUB record(s); {summary}.')
 
@@ -230,15 +238,22 @@ class ScannerDialog(QDialog):
             QMessageBox.warning(self, 'AO3 Metadata Scanner',
                                 f'The {field} column was not found. Create it in Calibre first.')
             return
-        eligible = [r for r in self.rows if r[key] and not r[existing_key]]
+        # Replace existing values, but only when the EPUB supplied a usable result.
+        # Empty fandom/ship/series detections are not written over good metadata;
+        # safety flags are always explicit Yes/No results.
+        eligible = [
+            r for r in self.rows
+            if (r[key] is not None and (key in ('nsfw', 'dead_dove') or bool(r[key])))
+        ]
         if not eligible:
             QMessageBox.information(self, 'AO3 Metadata Scanner',
-                                    f'No scanned books with detected metadata and an empty {field} field.')
+                                    f'No scanned books with detected data for {field}.')
             return
         answer = QMessageBox.question(
             self, 'Confirm database update',
-            f'Write detected values to {field} for {len(eligible)} book(s)?\n\n'
-            f'Existing {field} values will not be changed. EPUB files will not be modified.',
+            f'Replace the existing {field} values with detected EPUB metadata for {len(eligible)} book(s)?\n\n'
+            f'This overwrites current Calibre values for these books. Books with no detected '
+            f'fandom/ship/series value are left unchanged. EPUB files will not be modified.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -246,7 +261,9 @@ class ScannerDialog(QDialog):
             return
         column_meta = self.db.field_metadata[field]
         is_multiple = bool(column_meta.get('is_multiple', False))
-        if is_multiple:
+        if key in ('nsfw', 'dead_dove'):
+            mapping = {r['id']: r[key] for r in eligible}
+        elif is_multiple:
             mapping = {r['id']: tuple(r[key]) for r in eligible}
         else:
             mapping = {r['id']: ', '.join(r[key]) for r in eligible}
