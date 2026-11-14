@@ -7,6 +7,6 @@ class AO3FandomScannerPlugin(InterfaceActionBase):
                    'and optionally populate #fandom, #ship, and the built-in series field.')
     supported_platforms = {'windows', 'osx', 'linux'}
     author = 'DracBiblio'
-    version = (0, 3, 5, 3 )
+    version = (0, 3, 5, 4 )
     minimum_calibre_version = (9, 18, 0)
     actual_plugin = 'calibre_plugins.ao3_fandom_scanner.ui:AO3FandomScanner'
