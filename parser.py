@@ -4,7 +4,7 @@ import zipfile
 from html.parser import HTMLParser
 
 AO3_WORK_RE = re.compile(r'https?://(?:www\.)?archiveofourown\.org/works/\d+', re.I)
-SERIES_PART_RE = re.compile(r'^\s*Part\s+(\d+)\s+of\s+(.+?)\s*$', re.I)
+SERIES_PART_RE = re.compile(r'^\s*Part\s+(\d+(?:\.\d+)?)\s+of\s+(.+?)\s*$', re.I)
 
 
 def clean_text(value):
@@ -31,8 +31,8 @@ def visible_text(fragment):
 
 
 def labelled_dl_fields(raw):
-    found = []
     pattern = re.compile(r'<dt\b[^>]*>\s*(.*?)\s*</dt>\s*<dd\b[^>]*>(.*?)</dd>', re.I | re.S)
+    found = []
     for label_html, value_html in pattern.findall(raw):
         label = visible_text(label_html).rstrip(':').lower()
         value = visible_text(value_html)
@@ -66,8 +66,8 @@ def fanficfare_fields(raw):
 
 
 def split_values(value):
-    # AO3 lists individual fandoms/relationships separated by comma-space.
-    # NOTE: series values must NOT go through this — series names may contain commas.
+    # AO3 separates multi-value fields with comma-space.
+    # Series values must NOT go through this (names may contain commas).
     return [clean_text(x) for x in re.split(r'\s*,\s*', value) if clean_text(x)]
 
 
@@ -81,8 +81,7 @@ AO3_NON_FANDOM_SUBJECTS = {
     'not rated', 'gen', 'teen', 'm/m', 'f/f', 'f/m', 'other',
 }
 
-# Substring guards catch warning variants ("Past Rape/Non-con", etc.)
-# that exact matching misses. Checked before the relationship heuristic.
+# Substring guards catch warning variants ("Past Rape/Non-con", etc.).
 AO3_NON_FANDOM_SUBSTRINGS = (
     'archive warnings', 'rape/non-con', 'underage',
     'chose not to use', 'audiences', 'rated ',
@@ -97,7 +96,8 @@ def is_non_fandom_subject(value):
 
 
 def opf_subjects(opf_text):
-    values = re.findall(r'<(?:\w+:)?subject\b[^>]*>(.*?)</(?:\w+:)?subject\s*>', opf_text, re.I | re.S)
+    values = re.findall(
+        r'<(?:\w+:)?subject\b[^>]*>(.*?)</(?:\w+:)?subject\s*>', opf_text, re.I | re.S)
     out = []
     for x in values:
         v = clean_text(re.sub(r'<[^>]+>', '', x))
@@ -107,24 +107,28 @@ def opf_subjects(opf_text):
 
 
 def is_relationship_subject(value):
+    # Slash is the reliable AO3 relationship separator in OPF subjects.
+    # Do not treat ampersands as relationship separators here: fandom names
+    # can contain '&' (e.g. 'Red White & Royal Blue - Casey McQuiston').
+    # Ampersand-only platonic relationships are left to labelled metadata,
+    # where the field label makes their meaning unambiguous.
     if '/' in value:
         left, right = value.split('/', 1)
-        if len(left.strip()) >= 4 and len(right.strip()) >= 4:
-            return True
-    if ' & ' in value:
-        left, right = value.split(' & ', 1)
         if len(left.strip()) >= 4 and len(right.strip()) >= 4:
             return True
     return False
 
 
 def fallback_subject_fields(subjects):
-    # Exclusion filter runs FIRST: several AO3 warnings contain '/'
-    # ("Rape/Non-con") and must not become fake relationships.
-    # Subject order on AO3 OPFs: fandoms, relationships, then extra tags.
-    # The saw_relationship cutoff keeps characters out of fandoms for
-    # multi-ship works; gen fics (characters only) may still leak — status
-    # flags this path for review.
+    """Infer fandoms/relationships from OPF subjects.
+
+    Exclusion filter runs FIRST: several AO3 warnings contain '/'
+    ("Rape/Non-con") and must not become fake relationships.
+    Subject order on AO3 OPFs: fandoms, relationships, extra tags.
+    The saw_relationship cutoff keeps characters out of fandoms for
+    multi-ship works; gen fics (characters only) may still leak —
+    callers flag this path for review.
+    """
     fandoms, relationships, saw_relationship = [], [], False
     for value in subjects:
         if is_non_fandom_subject(value):
@@ -160,21 +164,25 @@ def _format_series(name, index=None):
 
 
 def parse_series_value(value):
-    """Series fields arrive as 'Part 3 of Series Name' (AO3/FFF) or just a name."""
+    """Series values arrive as 'Part 3 of Name' (AO3/FFF) or just a name.
+    Returns 'Name (Part N)' or the bare name."""
     match = SERIES_PART_RE.match(value)
     if match:
-        part = match.group(1)
         name = clean_text(match.group(2))
-        return f'{name} (Part {part})' if name else None
+        return f'{name} (Part {match.group(1)})' if name else None
     return clean_text(value) or None
 
 
 def parse_epub(path):
-    """Returns (fandoms, ships, series, result). List values are detected
-    metadata; None lists mean 'not applicable', empty lists mean none found."""
+    """Returns (fandoms, ships, series, result).
+
+    Lists hold detected values; None means 'not applicable'
+    (e.g. not an AO3 book), empty list means none found.
+    """
     try:
         with zipfile.ZipFile(path, 'r') as zf:
             names = zf.namelist()
+
             opf_text = ''
             for name in names:
                 if name.lower().endswith('.opf'):
@@ -182,10 +190,12 @@ def parse_epub(path):
                         opf_text += zf.read(name).decode('utf-8', 'replace')
                     except Exception:
                         pass
+
             publisher_ao3 = bool(re.search(
-                r'<dc:publisher[^>]*>\s*(?:archiveofourown\.org|archive\s+of\s+our\s+own)', opf_text, re.I
-            ))
+                r'<dc:publisher[^>]*>\s*(?:archiveofourown\.org|archive\s+of\s+our\s+own)',
+                opf_text, re.I))
             url_ao3 = bool(AO3_WORK_RE.search(opf_text))
+
             parsed = []
             for name in names:
                 if not name.lower().endswith(('.html', '.htm', '.xhtml')):
@@ -220,14 +230,16 @@ def parse_epub(path):
                         series_list.append(item)
 
             used_fallback = False
-            # Series from FanFicFare's OPF meta tags — high confidence.
+
+            # FanFicFare writes the series into OPF meta tags — high confidence.
             if not series_list:
                 meta_name = _meta_content(opf_text, 'calibre:series')
                 if meta_name:
                     meta_index = _meta_content(opf_text, 'calibre:series_index')
                     series_list.append(_format_series(meta_name, meta_index))
                     used_fallback = True
-            # Labelled relationships but no labelled fandoms: consult subjects.
+
+            # Labelled relationships but no fandoms: consult subjects.
             if not fandoms:
                 subject_fandoms, _ = fallback_subject_fields(opf_subjects(opf_text))
                 if subject_fandoms:
@@ -235,12 +247,67 @@ def parse_epub(path):
                     used_fallback = True
 
             if fandoms or relationships or series_list:
-                if used_fallback:
-                    status = 'AO3 metadata found (partly inferred — review values)'
-                else:
-                    status = 'AO3 metadata found'
+                status = ('AO3 metadata found (partly inferred — review values)'
+                          if used_fallback else 'AO3 metadata found')
             else:
                 status = 'AO3 identified, but no fandom/relationship/series metadata found'
             return fandoms, relationships, series_list, status
+
     except (zipfile.BadZipFile, OSError) as e:
         return None, None, None, 'Could not read EPUB: ' + str(e)
+
+# Clear indicators of explicit sexual content. Ambiguous tags such as
+# "First Time", "Awkward Sex", "Kink Negotiation", and "Bad Sex" are
+# intentionally excluded unless another clear tag is present.
+NSFW_EXPLICIT_TAGS = {
+    'explicit sexual content', 'graphic sexual content',
+    'porn', 'porn without plot', 'porn with plot', 'pwp',
+    'improper use of an object', 'consensual but not safe or sane',
+    'smut', 'praise kink', 'pain kink', 'bdsm', 'dom/sub',
+    'free use', 'scent kink', 'alpha/beta/omega dynamics', 'a/b/o',
+    'knotting', 'owner/pet', 'oral sex', 'anal sex', 'vaginal sex',
+    'mutual masturbation', 'forced orgasm', 'orgasm denial',
+    'dirty talk', 'public sex', 'semi-public sex', 'rape/non-con',
+    'non-con', 'sex pollen', 'heat/rut', 'heat', 'rut',
+    'mating bond', 'somnophilia', 'cunnilingus', 'voyeurism',
+    'masturbation', 'mating press', 'cuckold', 'breeding kink',
+    'overstimulation', 'sexual overstimulation', 'feminization',
+    'sexual overstimulation/forced orgasm', 'lube', 'sounding',
+    'cockfucking', 'urethral gaping', 'come inflation', 'belly bulge',
+    'large cock', 'size difference', 'tentacle sex',
+    'non-human genitalia', 'rimming', 'fisting',
+}
+
+
+def _normalise_tag(value):
+    value = clean_text(value).casefold()
+    value = re.sub(r'[’‘]', "'", value)
+    value = re.sub(r'\s+', ' ', value)
+    return value.strip(' .;')
+
+
+def parse_safety_flags(path):
+    """Return (nsfw, dead_dove) as 'Yes'/'No' strings.
+
+    Explicit rating is an unconditional NSFW trigger. Clear sexual tags
+    trigger regardless of rating. Ambiguous tags alone do not.
+    """
+    subjects = []
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            for name in zf.namelist():
+                if name.lower().endswith('.opf'):
+                    try:
+                        raw = zf.read(name).decode('utf-8', 'replace')
+                    except Exception:
+                        continue
+                    subjects.extend(opf_subjects(raw))
+    except (zipfile.BadZipFile, OSError):
+        return 'No', 'No'
+
+    tags = {_normalise_tag(x) for x in subjects}
+    explicit_rating = any(x in {'explicit', 'explicit rating'} for x in tags)
+    has_explicit_tag = bool(tags.intersection(NSFW_EXPLICIT_TAGS))
+    dead_dove = 'dead dove: do not eat' in tags
+    return ('Yes' if explicit_rating or has_explicit_tag else 'No',
+            'Yes' if dead_dove else 'No')
